@@ -1,0 +1,273 @@
+---
+title: "Kaggle_housing_bt"
+author: "Yu Tang"
+date: "12/1/2021"
+output: html_document
+---
+```{r}
+library(naniar)
+library(ggplot2)
+library(OneR)
+library(randomForest)
+library(dplyr)
+library(glmnet)
+library(plotmo)
+library(caret)
+library(OptimalCutpoints) # Load optimal cutpoints
+library(xgboostExplainer) # Load XGboost Explainer
+library(pROC)
+library(SHAPforxgboost) # Load shap for XGBoost
+library(DMwR)
+library(xgboost)
+library(splitstackshape)
+library(forecast)
+library(fastDummies)
+```
+
+```{r}
+# For the XGBoost model 3 scenatrio: Lasso_min, Lasso_1se, Without_Lasso.
+total_data <- read.csv("train.csv")
+total_data[is.na.data.frame(total_data)] <- 0
+total_data$MSSubClass <- as.factor(total_data$MSSubClass)
+total_data$OverallQual <- as.factor(total_data$OverallQual)
+total_data$OverallCond <- as.factor(total_data$OverallCond)
+total_data$YrSold <- as.factor(total_data$YrSold)
+
+total_data$log_sale <- log(total_data$SalePrice)
+total_data <- total_data %>% select(!SalePrice)
+
+scale_total <- fastDummies::dummy_cols(total_data,remove_selected_columns = T)
+```
+
+```{r}
+set.seed(1)
+x_vars <- as.matrix(scale(scale_total %>% select(!log_sale)))
+
+
+doParallel::registerDoParallel(cores = 6)
+lambda_seq <- 10^seq(4, -4, by = -.01)
+cv.lasso <- cv.glmnet(x = x_vars,
+                      y = total_data$log_sale,
+                      alpha = 1,
+                      parallel = T,
+                      lambda = lambda_seq,
+                      nfolds = 5,
+                      family = "poisson")
+
+best_lam <- cv.lasso$lambda.min
+best_lam #locate the range of the best_lam
+plot(cv.lasso)
+
+set.seed(1)
+doParallel::registerDoParallel(cores = 6)
+lambda_seq <- seq(best_lam+0.2,best_lam-0.004,-0.0001)
+cv.lasso <- cv.glmnet(x = x_vars,
+                      y = scale_total$log_sale,
+                      alpha = 1,
+                      parallel = T,
+                      lambda = lambda_seq,
+                      nfolds = 5,
+                      family = "poisson")
+
+best_lam <- cv.lasso$lambda.min
+best_lam
+
+
+
+
+best.lasso <- glmnet(x = x_vars,
+                     y = scale_total$log_sale,
+                     alpha = 1,
+                     lambda = best_lam,
+                     family = "poisson")
+coef(best.lasso)
+lasso_coef <- as.data.frame(as.matrix(coef(best.lasso))) %>% filter(s0 != 0)
+lasso_coef_list <- row.names(lasso_coef)[-1]
+
+
+```
+
+
+
+```{r}
+test_data <- read.csv("test.csv")
+test_data[is.na.data.frame(test_data)] <- 0
+test_data$MSSubClass <- as.factor(test_data$MSSubClass)
+test_data$OverallQual <- as.factor(test_data$OverallQual)
+test_data$OverallCond <- as.factor(test_data$OverallCond)
+test_data$YrSold <- as.factor(test_data$YrSold)
+scale_test <- fastDummies::dummy_cols(test_data,remove_selected_columns = T)
+
+temp <- colnames(scale_total)
+temp1 <- colnames(scale_test)
+temp2 <- intersect(temp1,lasso_coef_list)
+
+xgb_prep <- scale_total[,temp2]
+xgb_prep_test <- scale_test[,temp2]
+xgbtrain <- xgb.DMatrix(data = as.matrix(xgb_prep), label = total_data$log_sale)
+xgbtest <- xgb.DMatrix(data = as.matrix(xgb_prep_test))
+
+```
+
+```{r}
+set.seed(1)
+xgb1 <-  xgb.cv(data = xgbtrain,
+                nthread = 6,
+                nfold = 5,
+                nrounds = 3000,
+                eta = .3,
+                verbose = 1,
+                print_every_n = 100,
+                early_stopping_rounds = 500,
+                objective = "reg:squarederror",
+                eval_metric = "rmse")
+
+plot_dat <- xgb1$evaluation_log[,c("iter","test_rmse_mean")]
+
+ggplot(plot_dat, aes(x = iter, y = test_rmse_mean))+
+  geom_point(alpha = 0.3, color = "blue")+
+  geom_smooth()+theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+
+```{r}
+#Grid search to find the best tuning combination for the model.
+grid_search <- expand.grid(
+  max_depth_list = 2,
+  min_child_weight = 0,
+  gamma_list = 0,
+  subsample_list = .88,
+  colsample_bytree = .21
+)
+rmse_vec <- rep(NA, nrow(grid_search))
+
+
+for (i in 1:nrow(grid_search)){
+set.seed(1)
+xgb1 <-  xgb.cv(data = xgbtrain,
+                nthread = 6,
+                nfold = 5,
+                nrounds = 10000,
+                eta = .3,
+                
+                max.depth = grid_search$max_depth_list[i],
+                min_child_weight = grid_search$min_child_weight[i],
+                gamma = grid_search$gamma_list[i],
+                subsample = grid_search$subsample_list[i],
+                colsample_bytree = grid_search$colsample_bytree[i],
+
+                verbose = 0,
+                print_every_n = 500,
+                early_stopping_rounds = 200,
+                objective = "reg:squarederror",
+                eval_metric = "rmse"
+                )
+rmse_vec[i] <- xgb1$evaluation_log$test_rmse_mean[xgb1$best_ntreelimit]
+}
+gs_result <- cbind(grid_search, rmse_vec)
+
+
+
+```
+
+
+
+```{r}
+eta_tuning <- function(x){
+set.seed(1)
+bst_eta <- xgb.cv(data = xgbtrain, 
+                  nthread = 6,
+                  nfold = 5,
+                  nrounds = 70000,
+                  eta = x,
+                  max.depth = 2,
+                  min_child_weight = 0,
+                  gamma = 0,
+                  subsample = 0.88,
+                  colsample_bytree = 0.21,
+                  verbose = 1,
+                  print_every_n = 2000,
+                  early_stopping_rounds = 500,
+                  objective = "reg:squarederror",
+                  eval_metric = "rmse")
+}
+
+eta_0.005 <- eta_tuning(0.005)
+eta_0.01 <- eta_tuning(0.01)
+eta_0.05 <- eta_tuning(0.05)
+eta_0.1 <- eta_tuning(0.1)
+eta_0.3 <- eta_tuning(0.3)
+
+pd1 <- cbind.data.frame(eta_0.001$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.001, nrow(eta_0.001$evaluation_log)))
+names(pd1)[c(1,2,3)] <- c("n_tree","rmse","eta")
+pd2 <- cbind.data.frame(eta_0.01$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.01, nrow(eta_0.01$evaluation_log)))
+names(pd2)[c(1,2,3)] <- c("n_tree","rmse","eta")
+pd3 <- cbind.data.frame(eta_0.05$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.05, nrow(eta_0.05$evaluation_log)))
+names(pd3)[c(1,2,3)] <- c("n_tree","rmse","eta")
+pd4 <- cbind.data.frame(eta_0.1$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.1, nrow(eta_0.1$evaluation_log)))
+names(pd4)[c(1,2,3)] <- c("n_tree","rmse","eta")
+pd5 <- cbind.data.frame(eta_0.3$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.3, nrow(eta_0.3$evaluation_log)))
+names(pd5)[c(1,2,3)] <- c("n_tree","rmse","eta")
+
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+
+```
+0.117767: .005 : lambda.min
+
+
+```{r}
+plot_data$eta <- as.factor(plot_data$eta)
+
+ggplot(plot_data, aes(x = n_tree, y = rmse, color = eta))+
+  geom_smooth(alpha = 0.5) +geom_point()+
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+```
+
+
+
+
+```{r}
+
+
+
+
+```
+
+
+
+```{r}
+set.seed(1)
+bst_xgb <-xgboost(data = xgbtrain, 
+                  nthread = 6,
+                  nrounds = 22500,
+                  eta = 0.005,
+                  max.depth = 2,
+                  min_child_weight = 0,
+                  gamma = 0,
+                  subsample = 0.88,
+                  colsample_bytree = 0.21,
+                  verbose = 1,
+                  print_every_n = 2000,
+                  early_stopping_rounds = 500,
+                  objective = "reg:squarederror",
+                  eval_metric = "rmse")
+
+
+boost_preds <- exp(predict(bst_xgb, xgbtest))
+kaggle_test_result <- cbind.data.frame(SalePrice=boost_preds)
+row.names(kaggle_test_result) <- test_data[,1]
+write.csv(kaggle_test_result, file = "kaggle_result.csv")
+```
+```{r}
+imp_dat <- xgb.importance(model = bst_xgb)
+xgb.plot.importance(imp_dat, top_n = 20)
+```
+
